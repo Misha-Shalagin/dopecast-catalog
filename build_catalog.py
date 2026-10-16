@@ -208,8 +208,8 @@ def build(limit=PER_GENRE, out_path="catalog.json"):
         ok = []
         for s in lst:
             r = results.get((g, s["u"]))
-            if not r:
-                continue
+            if not r or r["c"] in ("OGG", "OPUS"):
+                continue   # the app plays MP3/AAC/HLS; Ogg is not supported on macOS
             item = {"n": s["n"], "u": s["u"], "s": s["s"], "c": r["c"], "b": r["b"]}
             if s["l"]:
                 item["l"] = s["l"]
