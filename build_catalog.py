@@ -10,6 +10,7 @@ Standard library only. Run daily by .github/workflows/catalog.yml.
 import concurrent.futures as cf
 import http.client
 import json
+import os
 import re
 import socket
 import ssl
@@ -190,8 +191,31 @@ def probe_raw(url, t0):
         return None
 
 
+def load(name, default):
+    try:
+        return json.load(open(name, encoding="utf-8"))
+    except Exception:
+        return default
+
+
 def build(limit=PER_GENRE, out_path="catalog.json"):
+    # curation.json: reviewed by hand after listening (remove = not our genre at all, move = belongs to another genre)
+    cur = load("curation.json", {})
+    removed, moved = set(cur.get("remove", [])), cur.get("move", {})
+    # listen/report.json: what each station actually played (listen.py, every 3 hours)
+    heard = load(os.path.join("listen", "report.json"), {}).get("stations", {})
     cands = candidates()
+    for g in list(cands):
+        cands[g] = [s for s in cands[g] if s["u"] not in removed]
+    for g in list(cands):
+        for s in list(cands[g]):
+            to = moved.get(s["u"])
+            if to and to != g and to in cands:
+                cands[g].remove(s)
+                cands[to].append(dict(s, s="Soul" if to == "Soul & Funk" else to))
+    for g in cands:                                   # a moved station may already be listed there
+        seen = set()
+        cands[g] = [s for s in cands[g] if not (s["u"] in seen or seen.add(s["u"]))]
     total = sum(len(v) for v in cands.values())
     print(f"candidates: {total}", file=sys.stderr)
     flat = [(g, s) for g, lst in cands.items() for s in lst]
@@ -219,6 +243,9 @@ def build(limit=PER_GENRE, out_path="catalog.json"):
                 item["m"] = 1
             # ranking: announces track titles (→ covers), quality, popularity, quick to start
             item["_score"] = (2 if r["m"] else 0) + min(r["b"], 320) / 160 + min(s["votes"], 5000) / 2500 - r["ms"] / 4000
+            h = heard.get(s["u"])
+            if h and h.get("known", 0) >= 8 and h.get("fit") is not None:
+                item["_score"] += 3 * (h["fit"] - 0.5)          # plays its genre → up; mostly something else → to the end
             ok.append(item)
         ok.sort(key=lambda x: -x["_score"])
         for x in ok:
