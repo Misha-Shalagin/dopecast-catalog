@@ -33,8 +33,19 @@ GENRES = {
     "Jazz": ["jazz", "smooth jazz", "nu jazz", "acid jazz", "jazz funk", "bebop", "jazz fusion", "vocal jazz", "big band"],
     "Soul & Funk": ["soul", "funk", "neo soul", "classic soul", "northern soul", "motown", "rnb", "r&b"],
     "Mexican": ["ranchera", "mariachi", "regional mexicano", "norteño", "norteno", "bolero", "cumbia", "musica mexicana", "banda", "grupera"],
+    # sub-genres of Other in the app: few stations, best quality only (see SUB_* below)
+    "70s": ["70s", "1970s"],
+    "80s": ["80s", "1980s"],
+    "90s": ["90s", "1990s"],
+    "Rock 80–90": ["classic rock", "80s rock", "90s rock", "hard rock"],
+    "Rhythm & Blues": ["rhythm and blues", "classic r&b", "blues"],
+    "Metal": ["heavy metal", "metal", "thrash metal"],
+    "Easy Listening": ["easy listening", "soft rock", "beautiful music"],
+    "Lounge": ["lounge", "bossa nova", "cocktail"],
     "Other": ["eclectic", "downtempo", "lounge", "chillout", "trip hop", "ambient", "college radio"],
 }
+SUBS = {"70s", "80s", "90s", "Rock 80–90", "Rhythm & Blues", "Metal", "Easy Listening", "Lounge"}
+SUB_LIMIT = 60
 PLAYLISTS = {  # open, regularly refreshed playlists by genre (github.com/junguler/m3u-radio-music-playlists)
     "Jazz": ["jazz", "smooth_jazz", "acid_jazz", "big_band"],
     "Hip-Hop": ["hip_hop", "rap", "urban"],
@@ -104,7 +115,7 @@ def candidates():
     for g in GENRES:
         for s in out[g]:
             text = s["n"] + " " + s["tags"]
-            if BLOCK.search(text) or (g != "Other" and NOT_OURS.search(s["n"])):
+            if BLOCK.search(text) or (g != "Other" and g not in SUBS and NOT_OURS.search(s["n"])):
                 continue
             if g == "Mexican" and not MEXICAN.search(text):
                 continue
@@ -233,7 +244,9 @@ def build(limit=PER_GENRE, out_path="catalog.json"):
         for s in lst:
             r = results.get((g, s["u"]))
             if not r or r["c"] in ("OGG", "OPUS"):
-                continue   # the app plays MP3/AAC/HLS; Ogg is not supported on macOS
+                continue
+            if g in SUBS and not (r["b"] >= 128 or (r["c"] == "AAC" and r["b"] >= 64)):
+                continue   # sub-genres keep good-quality streams only   # the app plays MP3/AAC/HLS; Ogg is not supported on macOS
             item = {"n": s["n"], "u": s["u"], "s": s["s"], "c": r["c"], "b": r["b"]}
             if s["l"]:
                 item["l"] = s["l"]
@@ -250,7 +263,7 @@ def build(limit=PER_GENRE, out_path="catalog.json"):
         ok.sort(key=lambda x: -x["_score"])
         for x in ok:
             x.pop("_score")
-        cat[g] = ok[:limit]
+        cat[g] = ok[:SUB_LIMIT if g in SUBS else limit]
         print(f"{g}: {len(ok)} working of {len(lst)}", file=sys.stderr)
     doc = {"updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "genres": cat}
     with open(out_path, "w", encoding="utf-8") as f:
