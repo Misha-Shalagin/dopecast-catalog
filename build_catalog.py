@@ -26,6 +26,8 @@ PER_TAG = 300              # candidates asked from the directory per tag
 WORKERS = 128
 TIMEOUT = 8                # seconds per stream check
 MIN_BYTES = 16 * 1024      # a live stream sends this much quickly
+SPEED_SECONDS = 10         # then it must keep up with real time for this long
+MIN_SPEED = 0.95           # delivered / needed; a healthy live stream holds 1.00
 
 GENRES = {
     "Hip-Hop": ["old school hip hop", "hip hop", "hiphop", "rap", "g-funk", "boom bap", "west coast hip hop", "90s hip hop", "jazz rap"],
@@ -46,6 +48,14 @@ GENRES = {
 }
 SUBS = {"70s", "80s", "90s", "Rock 80–90", "Rhythm & Blues", "Metal", "Easy Listening", "Lounge"}
 SUB_LIMIT = 60
+# Strict genres: a station is listed only after listen.py has proven it plays the genre
+# (every genre except Other). New stations are listened to via listen/pool.json and join once proven.
+MIN_KNOWN = 10             # identified plays needed before judging
+MIN_FIT = 0.75             # share of plays on genre
+MAX_POP = 0.15             # share of modern mainstream (debut 2005+, 1M+ fans); not judged until listen.py knows
+MIN_PROVEN = 10            # fewer proven than this (a new genre, first days): old ranking is used and a warning printed
+CHART = re.compile(r"\bhits?\b|\bcharts?\b|top ?(40|100)|\btop rap|\btrap|turn ?up|pregame", re.I)   # chart / modern names: never in strict genres
+POOL_LIMIT, SUB_POOL_LIMIT = 700, 200   # working candidates listen.py listens to
 PLAYLISTS = {  # open, regularly refreshed playlists by genre (github.com/junguler/m3u-radio-music-playlists)
     "Jazz": ["jazz", "smooth_jazz", "acid_jazz", "big_band"],
     "Hip-Hop": ["hip_hop", "rap", "urban"],
@@ -56,7 +66,7 @@ PLAYLISTS = {  # open, regularly refreshed playlists by genre (github.com/jungul
 RAW = "https://raw.githubusercontent.com/junguler/m3u-radio-music-playlists/main/{}.m3u"
 DIRECTORY = ["https://all.api.radio-browser.info", "https://de1.api.radio-browser.info",
              "https://de2.api.radio-browser.info", "https://fi1.api.radio-browser.info", "https://nl1.api.radio-browser.info"]
-BLOCK = re.compile(r"соловь|вести|радио россии|россия|sputnik|звезда|маяк|rt news|патриот", re.I)
+BLOCK = re.compile(r"соловь|вести|радио россии|россия|sputnik|звезда|маяк|rt news|патриот|свобод|svoboda|liberty|meduza|медуз|эхо москв|echo of moscow|дождь|dozhd|настоящее время|current time|голос америки|voice of america", re.I)
 NOT_OURS = re.compile(r"\b(top 40|hits|pop|dance|edm|reggaeton|trap|k-pop|house|techno|trance)\b", re.I)
 MEXICAN = re.compile(r"mexic|méxico|ranchera|norte[ñn]|banda|grupera|mariachi|cumbia|regional|tejano|duranguense|jalisco|monterrey|guadalajara|tijuana", re.I)
 
@@ -90,7 +100,7 @@ def candidates():
                 url = x.get("url_resolved") or x.get("url") or ""
                 if not name or not url.startswith("http"):
                     continue
-                out[g].append({"n": name[:80], "u": url, "s": tag.title().replace("Hip Hop", "Hip-Hop").replace("Rnb", "R&B"),
+                out[g].append({"n": name[:80], "u": url, "s": (tag if tag[:1].isdigit() else tag.title()).replace("Hip Hop", "Hip-Hop").replace("Rnb", "R&B").replace("R&B", "R&B"),
                                "l": x.get("favicon") or "", "city": x.get("state") or x.get("country") or "",
                                "votes": x.get("votes") or 0, "tags": x.get("tags") or ""})
     for g, files in PLAYLISTS.items():
@@ -159,11 +169,36 @@ def probe(url):
                 kbps = int(re.match(r"\d+", h.get("icy-br", "0").split(",")[0]).group(0))
             except Exception:
                 kbps = 0
-            return {"c": codec, "b": kbps, "m": bool(h.get("icy-metaint")) or "mpegurl" in ctype, "ms": int((time.time() - t0) * 1000)}
+            ms = int((time.time() - t0) * 1000)           # time to the first audio, before the speed check
+            if "mpegurl" not in ctype and not keeps_up(r.read, kbps):
+                return None
+            return {"c": codec, "b": kbps, "m": bool(h.get("icy-metaint")) or "mpegurl" in ctype, "ms": ms}
     except http.client.HTTPException:
         return probe_raw(url, t0)   # old Shoutcast servers answer "ICY 200 OK", which urllib rejects
     except Exception:
         return None
+
+
+def keeps_up(read, kbps):
+    """After the connect burst, does the stream deliver audio at least as fast as it plays?
+    Stations that are slower than real time stutter whatever the player's buffer. Unknown bitrate: not judged."""
+    if kbps <= 0:
+        return True
+    rate = kbps * 1000 / 8
+    t0, got = time.time(), 0
+    try:
+        while time.time() - t0 < 3:                     # skip the burst a server sends on connect
+            if not read(16384):
+                return False
+        t0 = time.time()
+        while time.time() - t0 < SPEED_SECONDS:
+            chunk = read(16384)
+            if not chunk:
+                return False
+            got += len(chunk)
+    except Exception:
+        return False
+    return got / rate / max(time.time() - t0, 1) >= MIN_SPEED
 
 
 def probe_raw(url, t0):
@@ -182,10 +217,10 @@ def probe_raw(url, t0):
             if not chunk:
                 break
             data += chunk
-        sock.close()
         head, _, body = data.partition(b"\r\n\r\n")
         first = head.split(b"\r\n", 1)[0]
         if b" 200" not in first or len(body) < MIN_BYTES // 2:
+            sock.close()
             return None
         h = {}
         for line in head.split(b"\r\n")[1:]:
@@ -197,7 +232,12 @@ def probe_raw(url, t0):
             kbps = int(re.match(r"\d+", h.get("icy-br", "0")).group(0))
         except Exception:
             kbps = 0
-        return {"c": codec, "b": kbps, "m": bool(h.get("icy-metaint")), "ms": int((time.time() - t0) * 1000)}
+        ms = int((time.time() - t0) * 1000)
+        ok = keeps_up(sock.recv, kbps)
+        sock.close()
+        if not ok:
+            return None
+        return {"c": codec, "b": kbps, "m": bool(h.get("icy-metaint")), "ms": ms}
     except Exception:
         return None
 
@@ -238,7 +278,7 @@ def build(limit=PER_GENRE, out_path="catalog.json"):
             r = f.result()
             if r:
                 results[(g, s["u"])] = r
-    cat = {}
+    cat, pool = {}, {}
     for g, lst in cands.items():
         ok = []
         for s in lst:
@@ -263,12 +303,28 @@ def build(limit=PER_GENRE, out_path="catalog.json"):
         ok.sort(key=lambda x: -x["_score"])
         for x in ok:
             x.pop("_score")
+        pool[g] = [{"n": x["n"], "u": x["u"]} for x in ok[:SUB_POOL_LIMIT if g in SUBS else POOL_LIMIT]]
+        if g != "Other":
+            sure = [x for x in ok if proven(heard.get(x["u"]), g) and not CHART.search(x["n"])]
+            if len(sure) >= MIN_PROVEN:
+                ok = sure
+            else:
+                print(f"WARNING {g}: only {len(sure)} proven by listening, old ranking kept for now", file=sys.stderr)
         cat[g] = ok[:SUB_LIMIT if g in SUBS else limit]
-        print(f"{g}: {len(ok)} working of {len(lst)}", file=sys.stderr)
+        print(f"{g}: {len(cat[g])} listed, {len(pool[g])} listened to, {len(lst)} candidates", file=sys.stderr)
     doc = {"updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "genres": cat}
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(doc, f, ensure_ascii=False, separators=(",", ":"))
+    os.makedirs("listen", exist_ok=True)
+    with open(os.path.join("listen", "pool.json"), "w", encoding="utf-8") as f:
+        json.dump({"genres": pool}, f, ensure_ascii=False, separators=(",", ":"))
     return doc
+
+
+def proven(h, g):
+    """listen/report.json says this station plays its genre and not modern mainstream."""
+    return bool(h and h.get("genre") == g and h.get("known", 0) >= MIN_KNOWN and (h.get("fit") or 0) >= MIN_FIT
+                and (h.get("pop") is None or h["pop"] <= MAX_POP))
 
 
 if __name__ == "__main__":

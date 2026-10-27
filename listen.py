@@ -2,11 +2,14 @@
 """Dopecast: listen to what the catalogue stations actually play.
 
 Run every 3 hours by .github/workflows/listen.yml. Each run:
-  1. reads the current track title of every catalogue station (a few KB per station, no audio kept);
+  1. reads the current track title of every station in listen/pool.json (all working candidates, written by
+     build_catalog.py; catalog.json until it exists) - a few KB per station, no audio kept;
   2. appends new tracks to listen/history.jsonl (last 21 days are kept);
-  3. looks up the main genre of new artists on Deezer (artist + track, cached in listen/artists.json);
-  4. writes listen/report.json: per station, how much of what it plays fits its genre.
-build_catalog.py uses the report to push off-genre stations to the end of their genre;
+  3. looks up the main genre of new artists on Deezer (artist + track, cached in listen/artists.json)
+     and their fans and debut year (listen/artist_info.json, most played artists first);
+  4. writes listen/report.json: per station, how much of what it plays fits its genre (RULES)
+     and how much is modern mainstream (debut 2005+ and 1M+ fans on Deezer).
+build_catalog.py keeps only stations proven by the report in every genre except Other;
 curation.json (reviewed by hand) removes or moves stations for good.
 Standard library only.
 """
@@ -29,20 +32,34 @@ DIR = os.path.join(HERE, "listen")
 HISTORY = os.path.join(DIR, "history.jsonl")
 ARTISTS = os.path.join(DIR, "artists.json")
 REPORT = os.path.join(DIR, "report.json")
-KEEP_DAYS = 21
+INFO = os.path.join(DIR, "artist_info.json")
+POOL = os.path.join(DIR, "pool.json")
+INFO_PER_RUN = 1200
+POP_SINCE, POP_FANS = 2005, 1_000_000     # "modern mainstream": debuted 2005 or later and 1M+ fans
+KEEP_DAYS = 14
 WORKERS = 64
 TIMEOUT = 8
 LOOKUPS_PER_RUN = 1500
 UA = "Dopecast-listen/1.0 (+https://github.com)"
 CTX = ssl.create_default_context()
 
-# Deezer genres that count as "on genre" for each Dopecast genre ("Other" is eclectic by design)
-FIT = {
-    "Hip-Hop": {"Rap/Hip Hop"},
-    "Soul & Funk": {"R&B", "Soul & Funk", "Disco", "Blues"},
-    "Jazz": {"Jazz", "Blues"},
-    "Chicano & Latin": {"Latin Music", "Rap/Hip Hop", "R&B", "Soul & Funk", "Brazilian Music", "Reggae"},
-    "Mexican": {"Latin Music"},
+# What counts as "on genre" for each Dopecast genre ("Other" is eclectic by design):
+#   fit - Deezer album genres;  era - artist debut years (needs artist_info);  pop - modern mainstream is judged
+LATIN = {"Latin Music", "Traditional Mexicano", "Banda/Grupero", "Bolero", "Cumbia", "Salsa"}
+RULES = {
+    "Hip-Hop": {"fit": {"Rap/Hip Hop"}, "pop": True},
+    "Soul & Funk": {"fit": {"R&B", "Soul & Funk", "Disco", "Blues"}, "pop": True},
+    "Jazz": {"fit": {"Jazz", "Blues"}},
+    "Chicano & Latin": {"fit": LATIN | {"Rap/Hip Hop", "R&B", "Soul & Funk", "Brazilian Music", "Reggae"}, "pop": True},
+    "Mexican": {"fit": LATIN, "pop": True},
+    "70s": {"era": (1950, 1979)},
+    "80s": {"era": (1960, 1989)},
+    "90s": {"era": (1970, 1999)},
+    "Rock 80–90": {"fit": {"Rock", "Alternative", "Metal"}, "era": (1960, 1999)},
+    "Rhythm & Blues": {"fit": {"R&B", "Soul & Funk", "Blues", "Disco"}, "pop": True},
+    "Metal": {"fit": {"Metal", "Rock"}},
+    "Easy Listening": {"fit": {"Pop", "Jazz", "Singer & Songwriter", "Films/Games", "Classical", "Folk", "Country", "Soul & Funk"}},
+    "Lounge": {"fit": {"Electro", "Jazz", "Dance", "Soul & Funk", "Alternative", "Pop", "Brazilian Music"}},
 }
 
 
@@ -231,10 +248,50 @@ def genre_of(artist, title):
     return "?"
 
 
+def info_of(artist):
+    """[Deezer fans, debut year] of an artist; [0, 0] if not found; None on network trouble."""
+    j = deezer("https://api.deezer.com/search/artist?limit=5&q=" + urllib.parse.quote(artist))
+    if j is None:
+        return None
+    a = nk(artist)
+    for x in j.get("data", []):
+        if nk(x.get("name")) == a:
+            al = deezer(f"https://api.deezer.com/artist/{x['id']}/albums?limit=100")
+            if al is None:
+                return None
+            years = [int(d["release_date"][:4]) for d in al.get("data", []) if (d.get("release_date") or "")[:4].isdigit()]
+            years = [y for y in years if y > 1900]
+            return [x.get("nb_fan") or 0, min(years) if years else 0]
+    return [0, 0]
+
+
+def judge(g, keys, artists, info):
+    """Per station: plays judged, share on genre, share modern mainstream (None until 10 plays have artist info)."""
+    rule = RULES[g]
+    known = on = en = pop = 0
+    mix = collections.Counter()
+    for k in keys:
+        gen, inf = artists.get(k, "?"), info.get(k) or [0, 0]
+        if gen != "?":
+            mix[gen] += 1
+        if inf[1]:
+            en += 1
+            pop += inf[1] >= POP_SINCE and inf[0] >= POP_FANS
+        if ("fit" in rule and gen == "?") or ("era" in rule and not inf[1]):
+            continue
+        known += 1
+        on += ("fit" not in rule or gen in rule["fit"]) and ("era" not in rule or rule["era"][0] <= inf[1] <= rule["era"][1])
+    return {"genre": g, "tracks": len(keys), "known": known,
+            "fit": round(on / known, 2) if known else None,
+            "pop": round(pop / en, 2) if en >= 10 else None,
+            "mix": mix.most_common(3)}
+
+
 def main():
     os.makedirs(DIR, exist_ok=True)
-    cat = json.load(open(os.path.join(HERE, "catalog.json"), encoding="utf-8"))
-    stations = [(g, s["n"], s["u"]) for g in FIT for s in cat["genres"].get(g, [])]
+    src = POOL if os.path.exists(POOL) else os.path.join(HERE, "catalog.json")
+    cat = json.load(open(src, encoding="utf-8"))
+    stations = [(g, s["n"], s["u"]) for g in RULES for s in cat["genres"].get(g, [])]
     now = int(time.time())
 
     # 1-2. what is playing now -> history
@@ -277,25 +334,29 @@ def main():
                 artists[k] = g
     json.dump(artists, open(ARTISTS, "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
 
+    # 3b. fans and debut year, most played artists first
+    info = json.load(open(INFO, encoding="utf-8")) if os.path.exists(INFO) else {}
+    count = collections.Counter(nk(r["artist"]) for r in hist)
+    names = {nk(r["artist"]): r["artist"] for r in hist}
+    need = [k for k, _ in count.most_common() if k and k not in info and artists.get(k, "?") != "?"][:INFO_PER_RUN]
+    with cf.ThreadPoolExecutor(6) as pool:
+        for k, v in zip(need, pool.map(lambda k: info_of(names[k]), need)):
+            if v is not None:
+                info[k] = v
+    json.dump(info, open(INFO, "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
+
     # 4. per-station report
     genre_of_url = {s[2]: s[0] for s in stations}
     plays = collections.defaultdict(list)
     for r in hist:
         if r["url"] in genre_of_url:
-            plays[r["url"]].append(artists.get(nk(r["artist"]), "?"))
-    report = {}
-    for url, gs in plays.items():
-        known = [x for x in gs if x != "?"]
-        g = genre_of_url[url]
-        fit = sum(x in FIT[g] for x in known) / len(known) if known else None
-        report[url] = {"genre": g, "tracks": len(gs), "known": len(known),
-                       "fit": round(fit, 2) if fit is not None else None,
-                       "mix": collections.Counter(known).most_common(3)}
+            plays[r["url"]].append(nk(r["artist"]))
+    report = {url: judge(genre_of_url[url], keys, artists, info) for url, keys in plays.items()}
     json.dump({"updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "stations": report},
               open(REPORT, "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
     titled = sum(1 for t in titles if t)
     print(f"stations {len(stations)}  sending titles {titled}  new tracks {added}  "
-          f"artists looked up {len(items)} (left {max(0, len(todo) - len(items))})  judged {sum(1 for v in report.values() if v['known'] >= 5)}")
+          f"artists looked up {len(items)} (left {max(0, len(todo) - len(items))})  artist info {len(need)}  judged {sum(1 for v in report.values() if v['known'] >= 5)}")
 
 
 if __name__ == "__main__":
