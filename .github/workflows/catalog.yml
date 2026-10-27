@@ -23,6 +23,7 @@ jobs:
         run: |
           git config user.name "dopecast-bot"
           git config user.email "dopecast-bot@users.noreply.github.com"
-          git add catalog.json
+          git add catalog.json listen/pool.json
           git diff --cached --quiet || git commit -m "Catalogue $(date -u +%F)"
+          git pull --rebase
           git push
