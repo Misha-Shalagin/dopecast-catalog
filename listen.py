@@ -35,6 +35,7 @@ REPORT = os.path.join(DIR, "report.json")
 INFO = os.path.join(DIR, "artist_info.json")
 POOL = os.path.join(DIR, "pool.json")
 INFO_PER_RUN = 1200
+MB_PER_RUN = 700                          # MusicBrainz allows one request a second
 POP_SINCE, POP_FANS = 2005, 1_000_000     # "modern mainstream": debuted 2005 or later and 1M+ fans
 KEEP_DAYS = 14
 WORKERS = 64
@@ -179,20 +180,6 @@ def split_title(t):
     return artist, title.strip()
 
 
-
-NOISE = re.compile(r"\b(advert|commercial|jingle|station id|unknown|untitled|live stream|on air|news|weather)\b", re.I)
-
-
-def split_title(t):
-    if not t or " - " not in t or NOISE.search(t):
-        return None
-    artist, title = t.split(" - ", 1)
-    artist = re.split(r"\s+(?:feat\.?|ft\.?|featuring|&|x|vs\.?|with)\s+|\s*[,;/]\s+", artist.strip(), flags=re.I)[0].strip(" -\"'")
-    if len(artist) < 2 or len(artist) > 60 or not title.strip():
-        return None
-    return artist, title.strip()
-
-
 # ---------- Deezer: artist + track -> album genre ----------
 _lock, _next = threading.Lock(), [0.0]
 
@@ -265,6 +252,35 @@ def info_of(artist):
     return [0, 0]
 
 
+def mb_start(artist):
+    """Year the artist started, from MusicBrainz: a band's founding year, a person's birth year + 20.
+    Deezer dates come from the albums it has, often remasters (Creedence 2006, John Lennon 2007), so the earlier wins.
+    0 if unknown; None on network trouble."""
+    url = "https://musicbrainz.org/ws/2/artist/?fmt=json&limit=3&query=" + urllib.parse.quote(f'artist:"{artist}"')
+    req = urllib.request.Request(url, headers={"User-Agent": "Dopecast-listen/1.0 (https://github.com/Misha-Shalagin/dopecast-catalog)"})
+    for _ in range(2):
+        time.sleep(1.1)
+        try:
+            with urllib.request.urlopen(req, timeout=15, context=CTX) as r:
+                j = json.loads(r.read())
+            break
+        except Exception:
+            j = None
+    if j is None:
+        return None
+    for x in j.get("artists", []):
+        y = ((x.get("life-span") or {}).get("begin") or "")[:4]
+        if x.get("score", 0) >= 95 and nk(x.get("name")) == nk(artist) and y.isdigit():
+            return int(y) + (20 if x.get("type") == "Person" else 0)
+    return 0
+
+
+def debut(inf):
+    """Earliest known start of an artist: Deezer albums or MusicBrainz, whichever is earlier."""
+    ys = [y for y in (inf or [])[1:3] if y]
+    return min(ys) if ys else 0
+
+
 def judge(g, keys, artists, info):
     """Per station: plays judged, share on genre, share modern mainstream (None until 10 plays have artist info)."""
     rule = RULES[g]
@@ -272,15 +288,16 @@ def judge(g, keys, artists, info):
     mix = collections.Counter()
     for k in keys:
         gen, inf = artists.get(k, "?"), info.get(k) or [0, 0]
+        d = debut(inf)
         if gen != "?":
             mix[gen] += 1
-        if inf[1]:
+        if d:
             en += 1
-            pop += inf[1] >= POP_SINCE and inf[0] >= POP_FANS
-        if ("fit" in rule and gen == "?") or ("era" in rule and not inf[1]):
+            pop += d >= POP_SINCE and inf[0] >= POP_FANS
+        if ("fit" in rule and gen == "?") or ("era" in rule and not d):
             continue
         known += 1
-        on += ("fit" not in rule or gen in rule["fit"]) and ("era" not in rule or rule["era"][0] <= inf[1] <= rule["era"][1])
+        on += ("fit" not in rule or gen in rule["fit"]) and ("era" not in rule or rule["era"][0] <= d <= rule["era"][1])
     return {"genre": g, "tracks": len(keys), "known": known,
             "fit": round(on / known, 2) if known else None,
             "pop": round(pop / en, 2) if en >= 10 else None,
@@ -343,6 +360,12 @@ def main():
         for k, v in zip(need, pool.map(lambda k: info_of(names[k]), need)):
             if v is not None:
                 info[k] = v
+    # 3c. MusicBrainz start year (fixes remaster dates), most played first
+    mb = [k for k, _ in count.most_common() if k in info and len(info[k]) < 3 and not 0 < info[k][1] < 1980][:MB_PER_RUN]   # an early Deezer date is already right
+    for k in mb:
+        y = mb_start(names[k])
+        if y is not None:
+            info[k] = info[k][:2] + [y]
     json.dump(info, open(INFO, "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
 
     # 4. per-station report
@@ -356,7 +379,7 @@ def main():
               open(REPORT, "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
     titled = sum(1 for t in titles if t)
     print(f"stations {len(stations)}  sending titles {titled}  new tracks {added}  "
-          f"artists looked up {len(items)} (left {max(0, len(todo) - len(items))})  artist info {len(need)}  judged {sum(1 for v in report.values() if v['known'] >= 5)}")
+          f"artists looked up {len(items)} (left {max(0, len(todo) - len(items))})  artist info {len(need)} MusicBrainz {len(mb)}  judged {sum(1 for v in report.values() if v['known'] >= 5)}")
 
 
 if __name__ == "__main__":
