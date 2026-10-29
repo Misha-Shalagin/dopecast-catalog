@@ -36,6 +36,8 @@ INFO = os.path.join(DIR, "artist_info.json")
 POOL = os.path.join(DIR, "pool.json")
 INFO_PER_RUN = 1200
 MB_PER_RUN = 700                          # MusicBrainz allows one request a second
+RUN_BUDGET = 30 * 60                       # the job has 45 minutes; MusicBrainz stops here so the results are always saved
+T0 = time.time()
 POP_SINCE, POP_FANS = 2005, 1_000_000     # "modern mainstream": debuted 2005 or later and 1M+ fans
 KEEP_DAYS = 14
 WORKERS = 64
@@ -362,7 +364,11 @@ def main():
                 info[k] = v
     # 3c. MusicBrainz start year (fixes remaster dates), most played first
     mb = [k for k, _ in count.most_common() if k in info and len(info[k]) < 3 and not 0 < info[k][1] < 1980][:MB_PER_RUN]   # an early Deezer date is already right
+    done = 0
     for k in mb:
+        if time.time() - T0 > RUN_BUDGET:
+            break
+        done += 1
         y = mb_start(names[k])
         if y is not None:
             info[k] = info[k][:2] + [y]
@@ -379,7 +385,7 @@ def main():
               open(REPORT, "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
     titled = sum(1 for t in titles if t)
     print(f"stations {len(stations)}  sending titles {titled}  new tracks {added}  "
-          f"artists looked up {len(items)} (left {max(0, len(todo) - len(items))})  artist info {len(need)} MusicBrainz {len(mb)}  judged {sum(1 for v in report.values() if v['known'] >= 5)}")
+          f"artists looked up {len(items)} (left {max(0, len(todo) - len(items))})  artist info {len(need)} MusicBrainz {done}  judged {sum(1 for v in report.values() if v['known'] >= 5)}")
 
 
 if __name__ == "__main__":
